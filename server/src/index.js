@@ -1,0 +1,84 @@
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+const multer = require("multer");
+const { placeholderMeeting } = require("./placeholderMeeting");
+
+const PORT = Number(process.env.PORT) || 5000;
+
+const app = express();
+
+app.use(
+  cors({
+    origin: "http://localhost:5173"
+  })
+);
+
+app.use(express.json());
+
+const uploadsDir = path.join(__dirname, "..", "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const safeOriginal = (file.originalname || "upload")
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .slice(0, 120);
+
+    const ext = path.extname(safeOriginal);
+    const base = path.basename(safeOriginal, ext);
+    const stamp = Date.now();
+    cb(null, `${base}-${stamp}${ext}`);
+  }
+});
+
+const upload = multer({ storage });
+
+const meetings = new Map();
+
+app.post("/api/upload", upload.single("file"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "No file uploaded" });
+  }
+
+  const meetingId = `m_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const summaryMode = req.body?.summaryMode || "Default";
+
+  const meeting = {
+    ...placeholderMeeting,
+    id: meetingId,
+    summaryMode,
+    title: placeholderMeeting.title,
+    uploadedFilename: req.file.filename,
+    originalFilename: req.file.originalname
+  };
+
+  meetings.set(meetingId, meeting);
+
+  return res.json({ ok: true, meetingId, filename: req.file.filename });
+});
+
+app.get("/api/meetings/:id", (req, res) => {
+  const { id } = req.params;
+
+  const meeting = meetings.get(id);
+  if (!meeting) {
+    return res.json({ ok: true, meeting: { ...placeholderMeeting, id } });
+  }
+
+  return res.json({ ok: true, meeting });
+});
+
+app.get("/api/health", (req, res) => {
+  return res.json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
