@@ -1,3 +1,10 @@
+require("dotenv").config();
+const OpenAI = require("openai");
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -5,7 +12,7 @@ const fs = require("fs");
 const multer = require("multer");
 const { placeholderMeeting } = require("./placeholderMeeting");
 
-const PORT = Number(process.env.PORT) || 5000;
+const PORT = Number(process.env.PORT) || 5002;
 
 const app = express();
 
@@ -28,7 +35,7 @@ const storage = multer.diskStorage({
   },
   filename: function (req, file, cb) {
     const safeOriginal = (file.originalname || "upload")
-      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .replace(/[^a-zA-Z0-9._-]/g, "_")``
       .slice(0, 120);
 
     const ext = path.extname(safeOriginal);
@@ -79,6 +86,34 @@ app.get("/api/health", (req, res) => {
   return res.json({ ok: true });
 });
 
+console.log("OpenAI key loaded:", !!process.env.OPENAI_API_KEY);
+
+app.post("/api/ai/summarize", async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: `Summarize this meeting. Include:
+- Bullet summary
+- Action items
+- Owners if mentioned
+
+Transcript:
+${text}`,
+    });
+
+    res.json({ summary: response.output_text });
+  } catch (error) {
+    console.error("OpenAI error:", error);
+    res.status(500).json({ error: "AI request failed" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+

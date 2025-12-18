@@ -2,7 +2,8 @@ import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Button from "../components/Button.jsx";
 import Card from "../components/Card.jsx";
-import { uploadMeetingFile } from "../api/client.js";
+import { supabase } from "../lib/supabaseClient";
+
 
 const ACCEPTED_TYPES = [
   "audio/mpeg",
@@ -49,25 +50,60 @@ export default function UploadMeetingPage() {
   }, [status, selectedFile]);
 
   async function doUpload() {
-    if (!selectedFile) return;
-    setError(null);
+  if (!selectedFile) return;
 
-    try {
-      setStatus("uploading");
-      const res = await uploadMeetingFile({ file: selectedFile, summaryMode });
-      if (!res?.ok || !res?.meetingId) {
-        throw new Error("Upload failed");
-      }
+  setError(null);
 
-      setStatus("processing");
-      await new Promise((r) => setTimeout(r, 650));
-      setStatus("done");
-      navigate(`/results/${res.meetingId}`);
-    } catch (e) {
-      setStatus("idle");
-      setError(e?.message || "Something went wrong");
+  try {
+    setStatus("uploading");
+
+    // 1. Get authenticated user
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser();
+
+    if (authError || !user) {
+      throw new Error("You must be logged in to upload.");
     }
+
+    // 2. Upload file to Supabase Storage
+    const fileExt = selectedFile.name.split(".").pop();
+    const fileName = `${user.id}/${crypto.randomUUID()}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from("audio")
+      .upload(fileName, selectedFile);
+
+    if (uploadError) {
+      throw uploadError;
+    }
+
+    // 3. Create job record
+    const { data: job, error: insertError } = await supabase
+      .from("jobs")
+      .insert({
+        user_id: user.id,
+        status: "queued",
+        audio_path: fileName,
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    setStatus("success");
+
+    // 4. Navigate to results
+    navigate(`/results/${job.id}`);
+  } catch (err) {
+    console.error(err);
+    setError(err.message || "Upload failed");
+    setStatus("error");
   }
+}
 
   function handlePickedFile(file) {
     setError(null);

@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import Button from "../components/Button.jsx";
 import Card from "../components/Card.jsx";
-import { getMeeting } from "../api/client.js";
 import { placeholderMeeting } from "../data/placeholderMeeting.js";
+import { supabase } from "../lib/supabaseClient.js";
 
 const TABS = [
   { id: "outcomes", label: "Outcome Summary" },
@@ -57,10 +57,20 @@ export default function ResultsPage() {
       setError(null);
 
       try {
-        const res = await getMeeting(id);
-        const m = res?.meeting || { ...placeholderMeeting, id };
-        if (!cancelled) setMeeting(m);
-      } catch (e) {
+        const { data, error } = await supabase
+  .from("jobs")
+  .select("*")
+  .eq("id", id)
+  .single();
+
+if (error) throw error;
+
+const m = data || { ...placeholderMeeting, id };
+if (!cancelled) setMeeting(m);
+
+      } catch (err) {
+  console.error(err);
+
         if (!cancelled) {
           setMeeting({ ...placeholderMeeting, id });
           setError("Could not reach the server. Showing placeholder results.");
