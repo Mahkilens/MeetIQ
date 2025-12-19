@@ -5,9 +5,11 @@
   "type": "commonjs",
   "main": "src/index.js",
   "scripts": {
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "ai:chat": "node scripts/ai-chat.js"
   },
   "dependencies": {
+    "ajv": "^8.17.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",

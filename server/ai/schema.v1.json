@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "summary": {
+    "title": "string",
+    "tldr": "string",
+    "bullets": ["string"]
+  },
+  "action_items": [
+    {
+      "task": "string",
+      "owner": "string | null",
+      "due_date": "string | null",
+      "evidence": {
+        "start_s": "number",
+        "end_s": "number"
+      }
+    }
+  ]
+}

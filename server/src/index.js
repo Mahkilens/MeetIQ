@@ -11,6 +11,8 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const { placeholderMeeting } = require("./placeholderMeeting");
+const runPipelineV1 = require("../ai/run.pipeline.v1");
+
 
 const PORT = Number(process.env.PORT) || 5002;
 
@@ -23,6 +25,30 @@ app.use(
 );
 
 app.use(express.json());
+
+app.post("/api/ai/summarize", async (req, res) => {
+  try {
+    const { transcriptText } = req.body;
+
+    if (!transcriptText || typeof transcriptText !== "string") {
+      return res.status(400).json({ error: "transcriptText is required" });
+    }
+
+    const result = await runPipelineV1({
+      transcriptText,
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    return res.json(result);
+  } catch (e) {
+    console.error("AI summarize error:", e);
+    return res.status(500).json({
+      error: e.message || "AI failed",
+      raw: e.raw // keep for dev; remove later if you want
+    });
+  }
+});
+
 
 const uploadsDir = path.join(__dirname, "..", "uploads");
 if (!fs.existsSync(uploadsDir)) {
