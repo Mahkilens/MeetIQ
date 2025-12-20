@@ -9,6 +9,7 @@
     "ai:chat": "node scripts/ai-chat.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.89.0",
     "ajv": "^8.17.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",

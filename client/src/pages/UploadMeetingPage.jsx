@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import Button from "../components/Button.jsx";
 import Card from "../components/Card.jsx";
 import { supabase } from "../lib/supabaseClient";
-
+import { summarizeTranscript } from "../api/ai"; // ✅ NEW
 
 const ACCEPTED_TYPES = [
   "audio/mpeg",
@@ -45,65 +45,98 @@ export default function UploadMeetingPage() {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
 
+  // ✅ NEW: transcript demo input
+  const [transcriptText, setTranscriptText] = useState(
+    "We decided to ship Friday. Alex will email the team by tomorrow."
+  );
+  const [aiStatus, setAiStatus] = useState("idle"); // idle | loading
+  const [aiError, setAiError] = useState(null);
+
   const canUpload = useMemo(() => {
     return status === "idle" && selectedFile && isAcceptedFile(selectedFile);
   }, [status, selectedFile]);
 
   async function doUpload() {
-  if (!selectedFile) return;
+    if (!selectedFile) return;
 
-  setError(null);
+    setError(null);
 
-  try {
-    setStatus("uploading");
+    try {
+      setStatus("uploading");
 
-    // 1. Get authenticated user
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
+      // 1. Get authenticated user
+      const {
+        data: { user },
+        error: authError
+      } = await supabase.auth.getUser();
 
-    if (authError || !user) {
-      throw new Error("You must be logged in to upload.");
+      if (authError || !user) {
+        throw new Error("You must be logged in to upload.");
+      }
+
+      // 2. Upload file to Supabase Storage
+      const fileExt = selectedFile.name.split(".").pop();
+      const fileName = `${user.id}/${crypto.randomUUID()}.${fileExt}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("audio")
+        .upload(fileName, selectedFile);
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      // 3. Create job record
+      const { data: job, error: insertError } = await supabase
+        .from("jobs")
+        .insert({
+          user_id: user.id,
+          status: "queued",
+          audio_path: fileName
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      setStatus("success");
+
+      // 4. Navigate to results (this is your real pipeline later)
+      navigate(`/results/${job.id}`);
+    } catch (err) {
+      console.error(err);
+      setError(err.message || "Upload failed");
+      setStatus("error");
     }
-
-    // 2. Upload file to Supabase Storage
-    const fileExt = selectedFile.name.split(".").pop();
-    const fileName = `${user.id}/${crypto.randomUUID()}.${fileExt}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from("audio")
-      .upload(fileName, selectedFile);
-
-    if (uploadError) {
-      throw uploadError;
-    }
-
-    // 3. Create job record
-    const { data: job, error: insertError } = await supabase
-      .from("jobs")
-      .insert({
-        user_id: user.id,
-        status: "queued",
-        audio_path: fileName,
-      })
-      .select()
-      .single();
-
-    if (insertError) {
-      throw insertError;
-    }
-
-    setStatus("success");
-
-    // 4. Navigate to results
-    navigate(`/results/${job.id}`);
-  } catch (err) {
-    console.error(err);
-    setError(err.message || "Upload failed");
-    setStatus("error");
   }
-}
+
+  // ✅ NEW: Demo summarize (paste transcript → AI → results)
+  async function doSummarizeDemo() {
+    setAiError(null);
+    if (!transcriptText.trim()) {
+      setAiError("Paste a transcript first.");
+      return;
+    }
+
+    try {
+      setAiStatus("loading");
+
+      const result = await summarizeTranscript(transcriptText);
+
+      // For now store result client-side; later you'll store in DB keyed by job.id
+      const id = crypto.randomUUID();
+      sessionStorage.setItem(`meeting:${id}`, JSON.stringify(result));
+
+      navigate(`/results/${id}`);
+    } catch (err) {
+      console.error(err);
+      setAiError(err.message || "AI summarize failed");
+    } finally {
+      setAiStatus("idle");
+    }
+  }
 
   function handlePickedFile(file) {
     setError(null);
@@ -207,6 +240,8 @@ export default function UploadMeetingPage() {
                       {status === "uploading" && "Uploading…"}
                       {status === "processing" && "Processing…"}
                       {status === "done" && "Done"}
+                      {status === "success" && "Uploaded"}
+                      {status === "error" && "Error"}
                     </div>
                   </div>
                 </div>
@@ -241,6 +276,36 @@ export default function UploadMeetingPage() {
                 <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
                   Files stay on your machine. Uploads are stored locally under `server/uploads`.
                 </div>
+              </div>
+            </div>
+
+            {/* ✅ NEW: Transcript → AI demo section */}
+            <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-5">
+              <div className="text-sm font-semibold text-slate-900">
+                Quick test (paste transcript → AI)
+              </div>
+              <div className="mt-1 text-xs text-slate-600">
+                This is for frontend hookup testing. Audio → transcript comes next.
+              </div>
+
+              <textarea
+                value={transcriptText}
+                onChange={(e) => setTranscriptText(e.target.value)}
+                className="mt-3 w-full rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-900"
+                rows={5}
+                placeholder="Paste transcript text here..."
+              />
+
+              {aiError ? (
+                <div className="mt-3 w-full rounded-xl border border-rose-200 bg-rose-50 p-3 text-left text-sm text-rose-700">
+                  {aiError}
+                </div>
+              ) : null}
+
+              <div className="mt-3">
+                <Button onClick={doSummarizeDemo} disabled={aiStatus === "loading"}>
+                  {aiStatus === "loading" ? "Summarizing…" : "Summarize transcript"}
+                </Button>
               </div>
             </div>
           </Card>

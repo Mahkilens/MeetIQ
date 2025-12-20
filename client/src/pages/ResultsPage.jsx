@@ -38,6 +38,37 @@ function confidenceLabel(value) {
   return { text: "Low", tone: "red" };
 }
 
+// ✅ Map AI JSON (v1) into the UI meeting shape this page expects
+function mapAiResultToMeeting(ai, id) {
+  const title = ai?.summary?.title || "Meeting Summary";
+  const tldr = ai?.summary?.tldr || "";
+  const bullets = Array.isArray(ai?.summary?.bullets) ? ai.summary.bullets : [];
+
+  const outcomeSummary = [
+    ...(tldr ? [tldr] : []),
+    ...bullets
+  ];
+
+  const actionItems = (ai?.action_items || []).map((a, idx) => ({
+    id: `ai-${idx}`,
+    text: a.task,
+    owner: a.owner || null,
+    urgency: a.due_date ? "Medium" : "—",     // placeholder mapping for now
+    confidence: 0.9                            // placeholder until we add quality scoring
+  }));
+
+  return {
+    ...placeholderMeeting,
+    id,
+    title,
+    outcomeSummary,
+    actionItems,
+    // keep transcript/missedMeetingBrief from placeholder for now
+    summaryMode: "Default",
+    date: new Date().toLocaleDateString()
+  };
+}
+
 export default function ResultsPage() {
   const { id } = useParams();
 
@@ -57,19 +88,28 @@ export default function ResultsPage() {
       setError(null);
 
       try {
+        // ✅ 1) Prefer demo AI result stored in sessionStorage
+        const stored = sessionStorage.getItem(`meeting:${id}`);
+        if (stored) {
+          const ai = JSON.parse(stored);
+          const m = mapAiResultToMeeting(ai, id);
+          if (!cancelled) setMeeting(m);
+          return;
+        }
+
+        // ✅ 2) Otherwise fall back to your current Supabase job fetch
         const { data, error } = await supabase
-  .from("jobs")
-  .select("*")
-  .eq("id", id)
-  .single();
+          .from("jobs")
+          .select("*")
+          .eq("id", id)
+          .single();
 
-if (error) throw error;
+        if (error) throw error;
 
-const m = data || { ...placeholderMeeting, id };
-if (!cancelled) setMeeting(m);
-
+        const m = data || { ...placeholderMeeting, id };
+        if (!cancelled) setMeeting(m);
       } catch (err) {
-  console.error(err);
+        console.error(err);
 
         if (!cancelled) {
           setMeeting({ ...placeholderMeeting, id });
