@@ -1,18 +1,37 @@
-export async function summarizeTranscript(transcriptText) {
-  const res = await fetch("http://localhost:5002/api/ai/summarize", {
+import { supabase } from "../lib/supabaseClient";
+
+/**
+ * PRIMARY FLOW
+ * Creates a meeting:
+ * - Authenticates user via Supabase access token
+ * - Runs AI pipeline on server
+ * - Persists to `public.meetings`
+ * - Returns { id }
+ */
+export async function createMeetingFromTranscript({
+  transcriptText,
+  summaryMode = "Default"
+}) {
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw error;
+
+  const token = data?.session?.access_token;
+  if (!token) throw new Error("Not logged in");
+
+  const res = await fetch("http://localhost:5002/api/meetings", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ transcriptText })
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ transcriptText, summaryMode })
   });
 
-  const data = await res.json().catch(() => null);
+  const json = await res.json().catch(() => null);
 
   if (!res.ok) {
-    const message = data?.error || `Request failed (${res.status})`;
-    const err = new Error(message);
-    err.data = data;
-    throw err;
+    throw new Error(json?.error || `Failed to create meeting (${res.status})`);
   }
 
-  return data;
+  return json; // { id }
 }

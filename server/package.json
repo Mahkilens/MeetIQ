@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "dev": "nodemon src/index.js",
-    "ai:chat": "node scripts/ai-chat.js"
+    "ai:chat": "node scripts/ai-chat.js",
+    "worker:jobs": "node src/worker/jobs.worker.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.89.0",

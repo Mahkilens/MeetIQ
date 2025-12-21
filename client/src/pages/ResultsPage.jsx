@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import Button from "../components/Button.jsx";
 import Card from "../components/Card.jsx";
 import { placeholderMeeting } from "../data/placeholderMeeting.js";
@@ -38,43 +38,53 @@ function confidenceLabel(value) {
   return { text: "Low", tone: "red" };
 }
 
-// ✅ Map AI JSON (v1) into the UI meeting shape this page expects
-function mapAiResultToMeeting(ai, id) {
-  const title = ai?.summary?.title || "Meeting Summary";
+function mapDbMeetingToUi(meetingRow) {
+  const ai = meetingRow?.summary_json;
+
+  const title = meetingRow?.title || ai?.summary?.title || "Meeting Summary";
   const tldr = ai?.summary?.tldr || "";
   const bullets = Array.isArray(ai?.summary?.bullets) ? ai.summary.bullets : [];
 
-  const outcomeSummary = [
-    ...(tldr ? [tldr] : []),
-    ...bullets
-  ];
+  const outcomeSummary = [...(tldr ? [tldr] : []), ...bullets];
 
   const actionItems = (ai?.action_items || []).map((a, idx) => ({
     id: `ai-${idx}`,
     text: a.task,
     owner: a.owner || null,
-    urgency: a.due_date ? "Medium" : "—",     // placeholder mapping for now
-    confidence: 0.9                            // placeholder until we add quality scoring
+    urgency: a.due_date ? "Medium" : "—",
+    confidence: 0.9
   }));
+
+  // If you have raw transcript text stored, show it as a single transcript line for now
+  const transcriptText = meetingRow?.transcript_text || "";
+  const transcript =
+    transcriptText.trim().length > 0
+      ? [{ t: "—", speaker: "Transcript", text: transcriptText }]
+      : placeholderMeeting.transcript;
 
   return {
     ...placeholderMeeting,
-    id,
+    id: meetingRow.id,
     title,
     outcomeSummary,
     actionItems,
-    // keep transcript/missedMeetingBrief from placeholder for now
-    summaryMode: "Default",
-    date: new Date().toLocaleDateString()
+    transcript,
+    summaryMode: meetingRow.summary_mode || "Default",
+    date: meetingRow.created_at
+      ? new Date(meetingRow.created_at).toLocaleDateString()
+      : "—"
   };
 }
 
 export default function ResultsPage() {
   const { id } = useParams();
+  const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState("outcomes");
   const [meeting, setMeeting] = useState(null);
+
   const [loading, setLoading] = useState(true);
+  const [processing, setProcessing] = useState(false);
   const [error, setError] = useState(null);
 
   const [transcriptQuery, setTranscriptQuery] = useState("");
@@ -82,49 +92,111 @@ export default function ResultsPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let pollTimer = null;
+
+    async function tryLoadAsMeeting(meetingId) {
+      const { data, error } = await supabase
+        .from("meetings")
+        .select("*")
+        .eq("id", meetingId)
+        .single();
+
+      if (error) return { ok: false, error };
+      return { ok: true, data };
+    }
+
+    async function tryLoadAsJob(jobId) {
+      const { data, error } = await supabase
+        .from("jobs")
+        .select("id,status,meeting_id,error,updated_at,created_at")
+        .eq("id", jobId)
+        .single();
+
+      if (error) return { ok: false, error };
+      return { ok: true, data };
+    }
 
     async function load() {
       setLoading(true);
+      setProcessing(false);
       setError(null);
 
+      // 1) First: assume :id is a MEETING id
       try {
-        // ✅ 1) Prefer demo AI result stored in sessionStorage
-        const stored = sessionStorage.getItem(`meeting:${id}`);
-        if (stored) {
-          const ai = JSON.parse(stored);
-          const m = mapAiResultToMeeting(ai, id);
+        const meetingRes = await tryLoadAsMeeting(id);
+
+        if (meetingRes.ok && meetingRes.data) {
+          const m = mapDbMeetingToUi(meetingRes.data);
           if (!cancelled) setMeeting(m);
+          if (!cancelled) setLoading(false);
           return;
         }
+      } catch {
+        // ignore and fall through to job path
+      }
 
-        // ✅ 2) Otherwise fall back to your current Supabase job fetch
-        const { data, error } = await supabase
-          .from("jobs")
-          .select("*")
-          .eq("id", id)
-          .single();
+      // 2) Otherwise: treat :id as a JOB id and poll until it has meeting_id
+      setProcessing(true);
 
-        if (error) throw error;
+      async function checkJobOnce() {
+        const jobRes = await tryLoadAsJob(id);
 
-        const m = data || { ...placeholderMeeting, id };
-        if (!cancelled) setMeeting(m);
-      } catch (err) {
-        console.error(err);
-
-        if (!cancelled) {
-          setMeeting({ ...placeholderMeeting, id });
-          setError("Could not reach the server. Showing placeholder results.");
+        if (!jobRes.ok) {
+          throw jobRes.error;
         }
-      } finally {
+
+        const job = jobRes.data;
+
+        // If worker produced a meeting, redirect
+        if (job?.meeting_id) {
+          // replace so back button doesn’t bounce through job id
+          navigate(`/results/${job.meeting_id}`, { replace: true });
+          return true;
+        }
+
+        // If worker errored, show error
+        if (job?.status === "error") {
+          throw new Error(job?.error || "Job failed");
+        }
+
+        return false;
+      }
+
+      try {
+        // check immediately once
+        const done = await checkJobOnce();
+        if (done) return;
+
+        // poll every 2s
+        pollTimer = setInterval(async () => {
+          try {
+            const done2 = await checkJobOnce();
+            if (done2 && pollTimer) clearInterval(pollTimer);
+          } catch (e) {
+            if (pollTimer) clearInterval(pollTimer);
+            if (!cancelled) setError(e.message || "Could not process job.");
+            if (!cancelled) setProcessing(false);
+            if (!cancelled) setLoading(false);
+          }
+        }, 2000);
+
         if (!cancelled) setLoading(false);
+      } catch (e) {
+        if (!cancelled) {
+          setError(e.message || "Could not load results.");
+          setProcessing(false);
+          setLoading(false);
+        }
       }
     }
 
     load();
+
     return () => {
       cancelled = true;
+      if (pollTimer) clearInterval(pollTimer);
     };
-  }, [id]);
+  }, [id, navigate]);
 
   const filteredTranscript = useMemo(() => {
     const items = meeting?.transcript || [];
@@ -137,6 +209,58 @@ export default function ResultsPage() {
     });
   }, [meeting, transcriptQuery]);
 
+  // UI: processing view (job id)
+  if (processing) {
+    return (
+      <div className="mx-auto w-full max-w-3xl px-4 py-10 sm:px-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-xs font-medium text-slate-500">Job</div>
+            <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">
+              Processing…
+            </h1>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Badge tone="amber">Queued/Processing</Badge>
+              <Badge>Id: {id}</Badge>
+            </div>
+            <div className="mt-3 text-sm text-slate-600">
+              We’re generating your notes now. This page will auto-update.
+            </div>
+
+            {error ? (
+              <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                {error}
+              </div>
+            ) : null}
+          </div>
+
+          <Link to="/">
+            <Button variant="outline">New upload</Button>
+          </Link>
+        </div>
+
+        <div className="mt-6">
+          <Card>
+            <div className="space-y-3">
+              <div className="h-4 w-52 rounded bg-slate-100" />
+              <div className="h-4 w-full rounded bg-slate-100" />
+              <div className="h-4 w-5/6 rounded bg-slate-100" />
+              <div className="h-4 w-2/3 rounded bg-slate-100" />
+            </div>
+
+            <div className="mt-5 text-xs text-slate-500">
+              Tip: keep your worker running:
+              <span className="ml-2 rounded bg-slate-100 px-2 py-1 font-mono">
+                npm run worker:jobs --workspace server
+              </span>
+            </div>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  // Normal meeting view
   return (
     <div className="mx-auto w-full max-w-6xl px-4 py-10 sm:px-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -361,7 +485,7 @@ export default function ResultsPage() {
             <Card>
               <div className="text-sm font-semibold text-slate-900">Export</div>
               <div className="mt-2 text-sm text-slate-600">
-                This is a starter template. Next steps: add markdown export, PDF, and structured JSON downloads.
+                Next steps: add markdown export, PDF, and structured JSON downloads.
               </div>
               <div className="mt-4 flex gap-2">
                 <Button variant="subtle" disabled>
@@ -376,7 +500,7 @@ export default function ResultsPage() {
             <Card>
               <div className="text-sm font-semibold text-slate-900">Pipeline status</div>
               <div className="mt-2 text-sm text-slate-600">
-                Local transcription + summarization integrations are coming (Whisper + Ollama).
+                Worker polls jobs → runs AI → writes meetings.
               </div>
             </Card>
           </div>
