@@ -4,6 +4,14 @@ import Button from "../components/Button.jsx";
 import Card from "../components/Card.jsx";
 import { placeholderMeeting } from "../data/placeholderMeeting.js";
 import { supabase } from "../lib/supabaseClient.js";
+import { compareActionItems, getBucket, groupAndSort } from "../lib/actionItemView.js";
+import {
+  downloadFile,
+  downloadPdf,
+  getDefaultExportFilenames,
+  toExportJSON,
+  toMarkdown,
+} from "../lib/exporters.js";
 
 const TABS = [
   { id: "outcomes", label: "Outcome Summary" },
@@ -34,8 +42,23 @@ function Badge({ children, tone = "slate" }) {
 
 function confidenceLabel(value) {
   if (value >= 0.85) return { text: "High", tone: "green" };
-  if (value >= 0.7) return { text: "Medium", tone: "amber" };
+  if (value >= 0.6) return { text: "Medium", tone: "amber" };
   return { text: "Low", tone: "red" };
+}
+
+function priorityTone(label) {
+  const v = (label || "").toLowerCase();
+  if (v === "critical") return "red";
+  if (v === "high") return "amber";
+  if (v === "medium") return "slate";
+  if (v === "low") return "slate";
+  return "slate";
+}
+
+function prettyPriority(label) {
+  const v = (label || "").toLowerCase();
+  if (!v) return "Needs review";
+  return v.charAt(0).toUpperCase() + v.slice(1);
 }
 
 function mapDbMeetingToUi(meetingRow) {
@@ -47,13 +70,8 @@ function mapDbMeetingToUi(meetingRow) {
 
   const outcomeSummary = [...(tldr ? [tldr] : []), ...bullets];
 
-  const actionItems = (ai?.action_items || []).map((a, idx) => ({
-    id: `ai-${idx}`,
-    text: a.task,
-    owner: a.owner || null,
-    urgency: a.due_date ? "Medium" : "—",
-    confidence: 0.9
-  }));
+  // actionItems will be attached later (from DB). Keep fallback only if needed.
+  const actionItems = [];
 
   // If you have raw transcript text stored, show it as a single transcript line for now
   const transcriptText = meetingRow?.transcript_text || "";
@@ -89,6 +107,73 @@ export default function ResultsPage() {
 
   const [transcriptQuery, setTranscriptQuery] = useState("");
   const [checked, setChecked] = useState(() => new Set());
+  const [actionItemsView, setActionItemsView] = useState("grouped");
+  const [collapsedSections, setCollapsedSections] = useState(() => ({
+    Overdue: false,
+    Today: false,
+    "This Week": false,
+    Later: true,
+    "No due date": false,
+    Completed: true,
+  }));
+  const [copied, setCopied] = useState(false);
+
+  const actionItemsForView = useMemo(() => {
+    const items = meeting?.actionItems || [];
+    return items.map((it) => ({
+      ...it,
+      completed: checked.has(it.id),
+    }));
+  }, [meeting?.actionItems, checked]);
+
+  const groupedActionItems = useMemo(() => {
+    return groupAndSort(actionItemsForView, new Date());
+  }, [actionItemsForView]);
+
+  const sortedActionItems = useMemo(() => {
+    return actionItemsForView.slice().sort((a, b) => compareActionItems(a, b, new Date()));
+  }, [actionItemsForView]);
+
+  async function copyTextToClipboard(text) {
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) {
+      void e;
+    }
+
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "absolute";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function buildMeetingDataForExport() {
+    return {
+      meeting: {
+        id: meeting?.id || id,
+        title: meeting?.title,
+        date: meeting?.date,
+        summaryMode: meeting?.summaryMode,
+        outcomeSummary: meeting?.outcomeSummary,
+        missedMeetingBrief: meeting?.missedMeetingBrief,
+        transcript: meeting?.transcript,
+      },
+      actionItems: actionItemsForView,
+    };
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -126,8 +211,61 @@ export default function ResultsPage() {
         const meetingRes = await tryLoadAsMeeting(id);
 
         if (meetingRes.ok && meetingRes.data) {
-          const m = mapDbMeetingToUi(meetingRes.data);
-          if (!cancelled) setMeeting(m);
+          const meetingRow = meetingRes.data;
+
+          // 1) Base meeting (summary + transcript)
+          const m = mapDbMeetingToUi(meetingRow);
+
+          // 2) Fetch action items from DB (priority-aware)
+          const { data: items, error: itemsErr } = await supabase
+            .from("action_items")
+            .select("*")
+            .eq("meeting_id", meetingRow.id)
+            .order("priority_score", { ascending: false })
+            .order("created_at", { ascending: true });
+
+          if (itemsErr) {
+            console.warn("⚠️ Could not load action_items:", itemsErr.message);
+          }
+
+          // 3) Map DB rows → UI
+          const actionItemsFromDb = Array.isArray(items)
+            ? items.map((r) => ({
+                id: r.id,
+                text: r.title,
+                owner: r.owner || null,
+                priority_label: r.priority_label || null,
+                priority_score: r.priority_score || null,
+                urgency: r.urgency || null,
+                impact: r.impact || null,
+                deadline_certainty: r.deadline_certainty || r.deadline_cert || null,
+                is_blocker: !!r.is_blocker,
+                due_at: r.due_at || null,
+                confidence: typeof r.confidence === "number" ? r.confidence : 0.75,
+                priority_source: r?.raw_json?.priority_source || null,
+                status: r.status || "open"
+              }))
+            : [];
+
+          // 4) If DB has no action items yet, fall back to AI summary_json action_items
+          let finalActionItems = actionItemsFromDb;
+
+          if (!finalActionItems.length) {
+            const ai = meetingRow?.summary_json;
+            finalActionItems = (ai?.action_items || []).map((a, idx) => ({
+              id: `ai-${idx}`,
+              text: a.task || a.title || "Untitled task",
+              owner: a.owner || null,
+              priority_label: a.priority || null,
+              priority_source: a.priority_source || null,
+              is_blocker: false,
+              due_at: null,
+              confidence: typeof a.confidence === "number" ? a.confidence : 0.75,
+              status: "open"
+            }));
+          }
+
+          if (!cancelled) setMeeting({ ...m, actionItems: finalActionItems });
           if (!cancelled) setLoading(false);
           return;
         }
@@ -341,17 +479,159 @@ export default function ResultsPage() {
 
                 {activeTab === "actions" ? (
                   <div>
-                    <div className="text-sm font-semibold text-slate-900">Action Items</div>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="text-sm font-semibold text-slate-900">Action Items</div>
+                      <div className="inline-flex rounded-full bg-white ring-1 ring-slate-200">
+                        <button
+                          type="button"
+                          onClick={() => setActionItemsView("grouped")}
+                          className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                            actionItemsView === "grouped"
+                              ? "bg-slate-900 text-white"
+                              : "text-slate-700 hover:bg-slate-50"
+                          }`}
+                        >
+                          Grouped
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setActionItemsView("list")}
+                          className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                            actionItemsView === "list"
+                              ? "bg-slate-900 text-white"
+                              : "text-slate-700 hover:bg-slate-50"
+                          }`}
+                        >
+                          List
+                        </button>
+                      </div>
+                    </div>
                     <div className="mt-3 space-y-2">
-                      {(meeting?.actionItems || []).map((item) => {
+                      {actionItemsView === "grouped" ? (
+                        [
+                          "Overdue",
+                          "Today",
+                          "This Week",
+                          "Later",
+                          "No due date",
+                          "Completed",
+                        ].map((section) => {
+                          const sectionItems = groupedActionItems[section] || [];
+                          if (!sectionItems.length) return null;
+                          const isCollapsed = !!collapsedSections[section];
+
+                          const helperText =
+                            section === "Overdue"
+                              ? "Past due"
+                              : section === "Today"
+                                ? "Due today"
+                                : section === "This Week"
+                                  ? "Next 7 days"
+                                  : null;
+
+                          return (
+                            <div key={section} className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm shadow-slate-200/30">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setCollapsedSections((prev) => ({
+                                    ...prev,
+                                    [section]: !prev[section],
+                                  }))
+                                }
+                                className="flex w-full items-center justify-between"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <div className="text-sm font-semibold text-slate-900">{section}</div>
+                                  <Badge>{String(sectionItems.length)}</Badge>
+                                  {helperText ? (
+                                    <div className="text-xs text-slate-500">{helperText}</div>
+                                  ) : null}
+                                </div>
+                                <div className="text-xs font-medium text-slate-500">
+                                  {isCollapsed ? "Show" : "Hide"}
+                                </div>
+                              </button>
+
+                              {!isCollapsed ? (
+                                <div className="mt-2 space-y-2">
+                                  {sectionItems.map((item) => {
+                                    const isChecked = checked.has(item.id);
+                                    const conf = confidenceLabel(item.confidence || 0);
+                                    const isFallbackPriority =
+                                      item?.priority_source === "fallback" || !item?.priority_label;
+                                    const pTone = priorityTone(isFallbackPriority ? "" : item.priority_label);
+
+                                    const bucket = getBucket(item, new Date());
+                                    const showOverdue = bucket === "Overdue";
+                                    const showDueToday = bucket === "Today";
+
+                                    return (
+                                      <label
+                                        key={item.id}
+                                        className="flex cursor-pointer gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/30"
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={isChecked}
+                                          onChange={(e) => {
+                                            setChecked((prev) => {
+                                              const next = new Set(prev);
+                                              if (e.target.checked) next.add(item.id);
+                                              else next.delete(item.id);
+                                              return next;
+                                            });
+                                          }}
+                                          className="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                        />
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            <div
+                                              className={`truncate text-sm font-medium ${
+                                                isChecked ? "text-slate-400 line-through" : "text-slate-900"
+                                              }`}
+                                            >
+                                              {item.text}
+                                            </div>
+                                            <Badge>{item.owner || "Unassigned"}</Badge>
+                                            <Badge tone={pTone}>
+                                              {isFallbackPriority
+                                                ? "Needs review"
+                                                : prettyPriority(item.priority_label)}
+                                            </Badge>
+                                            {showOverdue ? <Badge tone="red">Overdue</Badge> : null}
+                                            {showDueToday ? <Badge tone="amber">Due today</Badge> : null}
+                                            {item.is_blocker ? <Badge tone="red">Blocker</Badge> : null}
+                                            {item.due_at ? (
+                                              <Badge tone="indigo">
+                                                Due: {new Date(item.due_at).toLocaleDateString()}
+                                              </Badge>
+                                            ) : null}
+                                            <Badge tone={conf.tone}>{conf.text} confidence</Badge>
+                                          </div>
+                                          <div className="mt-1 text-xs text-slate-500">
+                                            Confidence: {Math.round((item.confidence || 0) * 100)}%
+                                          </div>
+                                        </div>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })
+                      ) : (
+                        sortedActionItems.map((item) => {
                         const isChecked = checked.has(item.id);
                         const conf = confidenceLabel(item.confidence || 0);
-                        const urgencyTone =
-                          item.urgency === "High"
-                            ? "red"
-                            : item.urgency === "Medium"
-                              ? "amber"
-                              : "slate";
+                        const isFallbackPriority =
+                          item?.priority_source === "fallback" || !item?.priority_label;
+                        const pTone = priorityTone(isFallbackPriority ? "" : item.priority_label);
+
+                        const bucket = getBucket(item, new Date());
+                        const showOverdue = bucket === "Overdue";
+                        const showDueToday = bucket === "Today";
 
                         return (
                           <label
@@ -381,7 +661,17 @@ export default function ResultsPage() {
                                   {item.text}
                                 </div>
                                 <Badge>{item.owner || "Unassigned"}</Badge>
-                                <Badge tone={urgencyTone}>{item.urgency || "—"}</Badge>
+                                <Badge tone={pTone}>
+                                  {isFallbackPriority ? "Needs review" : prettyPriority(item.priority_label)}
+                                </Badge>
+                                {showOverdue ? <Badge tone="red">Overdue</Badge> : null}
+                                {showDueToday ? <Badge tone="amber">Due today</Badge> : null}
+                                {item.is_blocker ? <Badge tone="red">Blocker</Badge> : null}
+                                {item.due_at ? (
+                                  <Badge tone="indigo">
+                                    Due: {new Date(item.due_at).toLocaleDateString()}
+                                  </Badge>
+                                ) : null}
                                 <Badge tone={conf.tone}>{conf.text} confidence</Badge>
                               </div>
                               <div className="mt-1 text-xs text-slate-500">
@@ -390,9 +680,10 @@ export default function ResultsPage() {
                             </div>
                           </label>
                         );
-                      })}
+                        })
+                      )}
 
-                      {!meeting?.actionItems?.length ? (
+                      {!actionItemsForView.length ? (
                         <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
                           No action items yet.
                         </div>
@@ -485,14 +776,51 @@ export default function ResultsPage() {
             <Card>
               <div className="text-sm font-semibold text-slate-900">Export</div>
               <div className="mt-2 text-sm text-slate-600">
-                Next steps: add markdown export, PDF, and structured JSON downloads.
+                Export this meeting as Markdown, JSON, or PDF.
               </div>
               <div className="mt-4 flex gap-2">
-                <Button variant="subtle" disabled>
-                  Copy summary
+                <Button
+                  variant="subtle"
+                  disabled={!meeting}
+                  onClick={async () => {
+                    const data = buildMeetingDataForExport();
+                    const md = toMarkdown(data);
+                    const ok = await copyTextToClipboard(md);
+                    if (ok) {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    }
+                  }}
+                >
+                  {copied ? "Copied!" : "Copy Markdown"}
                 </Button>
-                <Button variant="subtle" disabled>
-                  Download
+                <Button
+                  variant="subtle"
+                  disabled={!meeting}
+                  onClick={() => {
+                    const data = buildMeetingDataForExport();
+                    const obj = toExportJSON(data);
+                    const jsonString = JSON.stringify(obj, null, 2);
+                    const names = getDefaultExportFilenames(data);
+                    downloadFile(names.json, "application/json", jsonString);
+                  }}
+                >
+                  Download JSON
+                </Button>
+                <Button
+                  variant="subtle"
+                  disabled={!meeting}
+                  onClick={async () => {
+                    try {
+                      const data = buildMeetingDataForExport();
+                      await downloadPdf(data);
+                    } catch (e) {
+                      const msg = e?.message || "PDF export failed";
+                      alert(msg);
+                    }
+                  }}
+                >
+                  Download PDF
                 </Button>
               </div>
             </Card>
